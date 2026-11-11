@@ -25,10 +25,8 @@ while url_list and len(visited_url_set) < max_pages:
 
     visited_url_set.add(current_url)
 
-#　☑️for文などで特定のWebサイトに連続アクセスする場合は、必ず time.sleep(秒数) 処理をいれて、負荷をかけないようにする。
-for _ in range(10):
+    #　☑️1秒まつ
     time.sleep(1)
-    print("hogehoge")
 
     try:
         res = requests.get(current_url, timeout=10)
@@ -121,6 +119,7 @@ with sqlite3.connect('Github_google_repositories.db') as conn:
         FROM repositories
         ORDER BY name
     ''').fetchall()
+
     # リポジトリ名，主要な言語，スターの数
     for name, language, stars in rows:
         print(f"リポジトリ名：{name} 主要言語：{language} スターの数：{stars}")
