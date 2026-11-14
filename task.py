@@ -2,235 +2,229 @@ import os
 import re
 import sqlite3
 import time
+from email.utils import parsedate_to_datetime
 
 import requests
 from bs4 import BeautifulSoup
-from bs4.exceptions import ParserRejectedMarkup
+
 
 BASE_URL = 'https://github.com/orgs/google/repositories'
 DB_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
     'Github_google_repositories.db'
 )
-MAX_PAGES = 100
+MAX_RETRIES = 5
 
-language_names = {
+REPO_HREF_RE = re.compile(r'(?:https://github\.com)?/google/([^/?#]+)/?$')
+STAR_HREF_RE = re.compile(r'/google/[^/]+/stargazers/?$')
+STAR_TEXT_RE = re.compile(r'[\d,.]+[kKmM]?')
+LANGUAGE_NAMES = {
     'Assembly', 'Astro', 'Bazel', 'C', 'C#', 'C++', 'Clojure',
     'CoffeeScript', 'Crystal', 'CSS', 'Dart', 'Dockerfile', 'Elixir',
     'Elm', 'Erlang', 'F#', 'Fortran', 'Go', 'Groovy', 'Haskell',
-    'HTML', 'Java', 'JavaScript', 'Julia', 'Jupyter Notebook',
-    'Kotlin', 'Lua', 'Makefile', 'Markdown', 'MATLAB', 'Nix',
-    'Objective-C', 'OCaml', 'Pascal', 'Perl', 'PHP', 'PowerShell',
-    'Python', 'R', 'Ruby', 'Rust', 'Scala', 'Scheme', 'Shell',
-    'Solidity', 'SQL', 'Swift', 'TypeScript', 'Vim Script', 'Vue',
-    'WebAssembly', 'Wolfram Language'
+    'HTML', 'Java', 'JavaScript', 'Julia', 'Jupyter Notebook', 'Kotlin',
+    'Lua', 'Makefile', 'Markdown', 'MATLAB', 'Nix', 'Objective-C',
+    'OCaml', 'Pascal', 'Perl', 'PHP', 'PowerShell', 'Python', 'R',
+    'Ruby', 'Rust', 'Scala', 'Scheme', 'Shell', 'Solidity', 'SQL',
+    'Swift', 'TypeScript', 'Vim Script', 'Vue', 'WebAssembly',
+    'Wolfram Language'
 }
 
-REPO_HREF_RE = re.compile(r'(?:https://github\.com)?/google/([^/]+)/?$')
-STAR_HREF_RE = re.compile(r'/google/[^/]+/stargazers/?$')
-STAR_TEXT_RE = re.compile(r'[\d,.]+[kKmM]?')
 
+def fetch_soup(url):
+    headers = {'User-Agent': 'Mozilla/5.0 (compatible; repository-list-reader)'}
+    last_error = None
 
-def fetch_soup(url, retries=4):
-    for attempt in range(1, retries + 1):
-        time.sleep(1 if attempt == 1 else min(30, 2 ** attempt))
-
+    for attempt in range(1, MAX_RETRIES + 1):
+        # Keep a one-second interval before every page request, including retries.
+        time.sleep(1)
         try:
-            res = requests.get(
-                url,
-                headers={'User-Agent': 'Mozilla/5.0'},
-                timeout=10
+            response = requests.get(url, headers=headers, timeout=30)
+            if response.status_code == 200:
+                response.encoding = response.apparent_encoding
+                return BeautifulSoup(response.text, 'html.parser')
+
+            last_error = RuntimeError(
+                f'HTTP {response.status_code} {response.reason}: {url}'
             )
-        except requests.RequestException as e:
-            print(f"アクセスに失敗しました：{url} ({e})")
-            continue
+            retryable = response.status_code == 429 or response.status_code >= 500
+            if not retryable:
+                break
+            if response.status_code == 429:
+                # Honor GitHub's requested wait when supplied. Otherwise back
+                # off much longer than the normal one-second page interval.
+                retry_after = response.headers.get('Retry-After')
+                wait = None
+                if retry_after:
+                    try:
+                        wait = max(1, int(retry_after))
+                    except ValueError:
+                        try:
+                            wait = max(
+                                1,
+                                int(parsedate_to_datetime(retry_after).timestamp() - time.time())
+                            )
+                        except (TypeError, ValueError, OverflowError):
+                            wait = None
+                reset_at = response.headers.get('X-RateLimit-Reset')
+                if wait is None and response.headers.get('X-RateLimit-Remaining') == '0' and reset_at:
+                    try:
+                        wait = max(1, int(reset_at) - int(time.time()) + 1)
+                    except ValueError:
+                        wait = None
+                if wait is None:
+                    wait = min(900, 60 * (2 ** (attempt - 1)))
+            else:
+                wait = min(60, 2 ** attempt)
+        except requests.RequestException as exc:
+            last_error = exc
+            wait = min(60, 2 ** attempt)
 
-        print(f"取得中：{url}")
-        print(f"ステータスコード：{res.status_code}")
-        print(f"ステータスメッセージ：{res.reason}")
+        if attempt < MAX_RETRIES:
+            delay = min(60, 2 ** attempt)
+            print(f'取得に失敗しました。{delay}秒後に再試行します ({attempt}/{MAX_RETRIES})')
+            time.sleep(delay)
+            print(f'取得に失敗しました。{wait}秒後に再試行します ({attempt}/{MAX_RETRIES})')
+            time.sleep(wait)
 
-        if res.status_code == 429:
-            print(f"レート制限のため再試行します（{attempt}/{retries}）")
-            continue
-
-        if res.status_code != 200:
-            return None
-
-        res.encoding = res.apparent_encoding
-
-        try:
-            return BeautifulSoup(res.text, 'html.parser')
-        except ParserRejectedMarkup:
-            print(f"解析できないため、スキップ：{url}")
-            return None
-
-    return None
+    raise RuntimeError(f'ページを取得できませんでした: {url} ({last_error})')
 
 
-def extract_stars(card, star_link=None):
-    if star_link is None:
-        star_link = card.find('a', href=STAR_HREF_RE)
-
-    if star_link is not None:
-        star_text = star_link.get_text(' ', strip=True)
-        star_match = STAR_TEXT_RE.search(star_text)
-        if star_match:
-            return star_match.group(0)
+def extract_stars(card):
+    star_link = card.find('a', href=STAR_HREF_RE)
+    if star_link:
+        text = star_link.get_text(' ', strip=True)
+        match = STAR_TEXT_RE.search(text)
+        if match:
+            return match.group(0)
 
         labelled = ' '.join(filter(None, [
-            star_link.get('aria-label'),
-            star_link.get('title')
+            star_link.get('aria-label'), star_link.get('title')
         ]))
-        star_match = STAR_TEXT_RE.search(labelled)
-        if star_match:
-            return star_match.group(0)
+        match = STAR_TEXT_RE.search(labelled)
+        if match:
+            return match.group(0)
 
     for text in card.stripped_strings:
-        star_match = re.search(
-            r'([\d,.]+[kKmM]?)\s+stars?\b',
-            text,
-            re.I
-        )
-        if star_match:
-            return star_match.group(1)
-
+        match = re.search(r'([\d,.]+[kKmM]?)\s+stars?\b', text, re.I)
+        if match:
+            return match.group(1)
     return ''
 
 
 def extract_language(card):
-    language_tag = card.select_one('[itemprop="programmingLanguage"]')
-    if language_tag:
-        language = language_tag.get_text(strip=True)
-        if language:
-            return language
+    tag = card.select_one('[itemprop="programmingLanguage"]')
+    if tag and tag.get_text(strip=True):
+        return tag.get_text(strip=True)
 
-    language_tag = card.select_one('[class*="PrimaryLanguageName"]')
-    if language_tag:
-        language = language_tag.get_text(strip=True)
-        if language:
-            return language
+    tag = card.select_one('[class*="PrimaryLanguageName"]')
+    if tag and tag.get_text(strip=True):
+        return tag.get_text(strip=True)
 
     for element in card.find_all(['span', 'a']):
-        element_text = element.get_text(strip=True)
-        if element_text in language_names:
-            return element_text
-
+        value = element.get_text(strip=True)
+        if value in LANGUAGE_NAMES:
+            return value
     return ''
 
 
-def parse_repositories(html_soup):
-    page_repos = {}
-
-    items = html_soup.select(
-        'ul[data-listview-component="items-list"] > li'
-    )
-
-    if not items:
-        items = []
-        seen = set()
-        for repo_link in html_soup.find_all('a', href=REPO_HREF_RE):
-            card = repo_link.find_parent('li') or repo_link.parent
-            card_id = id(card)
-            if card_id not in seen:
-                seen.add(card_id)
-                items.append(card)
-
-    for card in items:
-        repo_link = card.find('a', href=REPO_HREF_RE)
-        if repo_link is None:
-            continue
-
-        href_match = REPO_HREF_RE.search(repo_link.get('href', ''))
-        if href_match is None:
-            continue
-
-        repo_name = href_match.group(1)
-        page_repos[repo_name] = {
-            'name': repo_name,
-            'language': extract_language(card),
-            'stars': extract_stars(card)
-        }
-
-    if page_repos:
-        return page_repos
-
-    # カード構造が取れない場合はスターリンクから復元する
-    for star_link in html_soup.find_all('a', href=STAR_HREF_RE):
-        star_path = star_link.get('href', '')
-        path_match = re.search(r'/google/([^/]+)/stargazers', star_path)
-        if path_match is None:
-            continue
-
-        repo_name = path_match.group(1)
-        page_repos[repo_name] = {
-            'name': repo_name,
-            'language': '',
-            'stars': extract_stars(star_link.parent or star_link, star_link)
-        }
-
-    return page_repos
-
-
-def main():
+def parse_repositories(soup):
     repositories = {}
+    cards = soup.select('ul[data-listview-component="items-list"] > li')
 
-    for page in range(1, MAX_PAGES + 1):
-        current_url = (
-            BASE_URL if page == 1 else f'{BASE_URL}?page={page}'
-        )
-        html_soup = fetch_soup(current_url)
-        if html_soup is None:
+    # Fallback for GitHub markup variations.
+    if not cards:
+        cards = []
+        seen_cards = set()
+        for link in soup.find_all('a', href=REPO_HREF_RE):
+            card = link.find_parent('li') or link.parent
+            if id(card) not in seen_cards:
+                seen_cards.add(id(card))
+                cards.append(card)
+
+    for card in cards:
+        link = card.find('a', href=REPO_HREF_RE)
+        if link is None:
             continue
+        match = REPO_HREF_RE.search(link.get('href', ''))
+        if match is None:
+            continue
+        name = match.group(1)
+        repositories[name] = {
+            'name': name,
+            'language': extract_language(card),
+            'stars': extract_stars(card),
+        }
 
-        page_repos = parse_repositories(html_soup)
-        if not page_repos:
+    return repositories
+
+
+def scrape_all_repositories():
+    repositories = {}
+    page = 1
+
+    while True:
+        url = BASE_URL if page == 1 else f'{BASE_URL}?page={page}'
+        print(f'取得中: {url}')
+        soup = fetch_soup(url)
+        page_repositories = parse_repositories(soup)
+
+        # GitHub's repository list ends with a page containing no repository cards.
+        if not page_repositories:
+            if page == 1:
+                raise RuntimeError('1ページ目からリポジトリを取得できませんでした')
             break
 
-        repositories.update(page_repos)
+        repositories.update(page_repositories)
+        print(f'{len(page_repositories)}件取得（累計 {len(repositories)}件）')
+        page += 1
 
-        for repo in page_repos.values():
-            if not repo['language']:
-                print(f"言語を取得できませんでした：{repo['name']}")
-            if not repo['stars']:
-                print(f"スター数を取得できませんでした：{repo['name']}")
+    return repositories
 
-    if not repositories:
-        print('リポジトリを取得できなかったため、データベースは更新しません')
-        return
 
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute('DROP TABLE IF EXISTS repositories')
-        conn.execute('''
-            CREATE TABLE repositories (
+def save_and_display(repositories):
+    # Replace saved data only after scraping reaches the end successfully.
+    with sqlite3.connect(DB_PATH) as connection:
+        connection.execute('''
+            CREATE TABLE IF NOT EXISTS repositories (
                 name TEXT PRIMARY KEY,
                 language TEXT,
                 stars TEXT
             )
         ''')
-
-        for repo in repositories.values():
-            conn.execute(
-                '''
-                INSERT INTO repositories (name, language, stars)
-                VALUES (?, ?, ?)
-                ''',
+        connection.execute('DELETE FROM repositories')
+        connection.executemany(
+            'INSERT INTO repositories (name, language, stars) VALUES (?, ?, ?)',
+            [
                 (repo['name'], repo['language'], repo['stars'])
-            )
+                for repo in repositories.values()
+            ],
+        )
 
-        rows = conn.execute('''
+        rows = connection.execute('''
             SELECT name, language, stars
             FROM repositories
             ORDER BY name
         ''').fetchall()
 
-        print(f"取得したリポジトリ数：{len(rows)}")
+    print(f'取得・保存したリポジトリ数: {len(rows)}')
+    for name, language, stars in rows:
+        print(f'リポジトリ名: {name} | 主要な言語: {language} | スターの数: {stars}')
+    print(f'DB保存先: {DB_PATH}')
 
-        for name, language, stars in rows:
-            print(
-                f"リポジトリ名：{name} "
-                f"主要言語：{language} "
-                f"スターの数：{stars}"
-            )
+
+def main():
+    try:
+        repositories = scrape_all_repositories()
+    except (requests.RequestException, RuntimeError, ValueError) as exc:
+        print(f'全ページの取得が完了しなかったため、DBは更新しません: {exc}')
+        return
+
+    if not repositories:
+        print('リポジトリを取得できなかったため、DBは更新しません')
+        return
+
+    save_and_display(repositories)
 
 
 if __name__ == '__main__':
